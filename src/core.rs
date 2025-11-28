@@ -3,7 +3,6 @@ use crate::structs::*;
 
 const OUTPUT_DIR: &str = "output";
 const TABLE_DIR: &str = "tables";
-const MODIFIED_DIR: &str = "modified";
 const MERGED_DIR: &str = "merged";
 const ENTRIES_FILE: &str = "entries.json";
 
@@ -12,14 +11,81 @@ pub fn unpack_map<P: AsRef<Path>>(path: P) {
 
     println!("Unpacking: `{}`", path.display());
 
-    let mut reader = File::open(path).unwrap().buffer_read();
-
-    let header = reader.read_struct::<MapHeader>().unwrap();
-
     let file_stem = path.file_stem().unwrap().to_str().unwrap();
     let output_dir = Path::new(OUTPUT_DIR).join(file_stem);
 
     fs::create_dir_all(&output_dir).unwrap();
+
+    // Process main file
+    let mut string_map = process_map(path, Some(&output_dir));
+
+    // Check for diff file and merge if exists
+    if !file_stem.ends_with("_diff") {
+        // Try both with and without .dat extension
+        let diff_names = [
+            format!("{}_diff.dat", file_stem),
+            format!("{}_diff", file_stem),
+        ];
+
+        for diff_name in &diff_names {
+            if let Some(parent) = path.parent() {
+                let diff_path = parent.join(diff_name);
+                if diff_path.exists() && diff_path.is_file() {
+                    println!("Found diff file at: `{}`", diff_path.display());
+                    println!("Merging entries from diff file...");
+                    let diff_map = process_map(&diff_path, None);
+                    println!("Merged {} entries from diff.", diff_map.len());
+                    
+                    for (id, value) in diff_map {
+                        if !value.is_empty() || !string_map.contains_key(&id) {
+                            string_map.insert(id, value);
+                        }
+                    }
+                    break; // Only merge one diff file
+                }
+            }
+        }
+    }
+
+    // Load existing entries.json if it exists to preserve user translations
+    {
+        let output_path = Path::new(&output_dir).join(ENTRIES_FILE);
+        if output_path.exists() {
+            println!("Found existing entries.json, preserving user translations...");
+            if let Ok(buffer) = fs::read(&output_path) {
+                if let Ok(existing_map) = serde_json::from_slice::<HashMap<u64, String>>(&buffer) {
+                    // We want to keep existing translations.
+                    // Logic: If ID exists in existing_map, use it.
+                    // If ID is new (from game update), use string_map's value.
+                    for (id, value) in existing_map {
+                        string_map.insert(id, value);
+                    }
+                    println!("Merged existing translations.");
+                }
+            }
+        }
+    }
+
+    {
+        let output_path = Path::new(&output_dir).join(ENTRIES_FILE);
+
+        let mut writer = File::create(&output_path).unwrap().buffer_write();
+
+        // To JSON
+        let json = json!(string_map);
+
+        let bytes = serde_json::to_vec_pretty(&json).unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
+
+    println!("Unpacked: `{}`", path.display());
+}
+
+fn process_map(path: &Path, output_dir: Option<&Path>) -> HashMap<u64, String> {
+    let mut reader = File::open(path).unwrap().buffer_read();
+
+    let header = reader.read_struct::<MapHeader>().unwrap();
+    let file_stem = path.file_stem().unwrap().to_str().unwrap();
 
     let seek_table = reader
         .read_array::<u32>((header.entry_count + 1) as usize)
@@ -55,7 +121,20 @@ pub fn unpack_map<P: AsRef<Path>>(path: P) {
 
                     // Min: (3 + 1(0xFF)) + 16(entry_count + n * 0x80) + 4(padding 0) = 24
                     // Max: (511 + 1(0xFF)) + 16(entry_count) = 528
-                    let bucket_size = ((table_header.entry_count + 1) + 16).max(24);
+                    let bucket_size = if file_stem.ends_with("_diff") {
+                        let count = table_header.entry_count;
+                        if count <= 8 {
+                            24
+                        } else if count <= 128 {
+                            32
+                        } else if count <= 256 {
+                            272
+                        } else {
+                            528
+                        }
+                    } else {
+                        ((table_header.entry_count + 1) + 16).max(24)
+                    };
                     let table_buckets =
                         table_reader.read_array::<u8>(bucket_size as usize).unwrap();
 
@@ -84,7 +163,29 @@ pub fn unpack_map<P: AsRef<Path>>(path: P) {
                                     eprintln!("Duplicate string id found: {:#x}", id);
                                 }
                             } else {
-                                eprintln!("Skipped invalid string at id: {:#x}", id);
+                                let mut handled = false;
+
+                                // For diff files, 0xFF might be a prefix for a valid string.
+                                // We try to read the content after 0xFF.
+                                if file_stem.ends_with("_diff") && entry.length >= 1 {
+                                    let len = (entry.length - 1) as usize;
+                                    if let Ok(bytes) = table_reader.read_array_at::<u8>(value_pos + 1, len) {
+                                        // Try strict UTF-8 first
+                                        if let Ok(value) = String::from_utf8(bytes.clone()) {
+                                            string_map.insert(id, value);
+                                            handled = true;
+                                        } else {
+                                            // Fallback to lossy to ensure we extract something
+                                            let value = String::from_utf8_lossy(&bytes).to_string();
+                                            string_map.insert(id, value);
+                                            handled = true;
+                                        }
+                                    }
+                                }
+
+                                if !handled {
+                                    eprintln!("Skipped invalid string at id: {:#x}", id);
+                                }
                             }
                         }
 
@@ -93,7 +194,7 @@ pub fn unpack_map<P: AsRef<Path>>(path: P) {
                 }
 
                 // Save tables
-                {
+                if let Some(output_dir) = output_dir {
                     let table_dir = output_dir.join(TABLE_DIR);
                     let table_path = table_dir.join(i.to_string());
 
@@ -112,19 +213,7 @@ pub fn unpack_map<P: AsRef<Path>>(path: P) {
         }
     }
 
-    {
-        let output_path = Path::new(&output_dir).join(ENTRIES_FILE);
-
-        let mut writer = File::create(&output_path).unwrap().buffer_write();
-
-        // To JSON
-        let json = json!(string_map);
-
-        let bytes = serde_json::to_vec_pretty(&json).unwrap();
-        writer.write_all(&bytes).unwrap();
-    }
-
-    println!("Unpacked: `{}`", path.display());
+    string_map
 }
 
 pub fn pack_map<P: AsRef<Path>>(dir_path: P) {
@@ -133,9 +222,54 @@ pub fn pack_map<P: AsRef<Path>>(dir_path: P) {
     println!("Packing: `{}`", dir_path.display());
 
     let entries_path = dir_path.join(ENTRIES_FILE);
-    let entries_map = fs::read(entries_path).map_or(Default::default(), |buffer| {
-        serde_json::from_slice::<HashMap<u64, String>>(&buffer).unwrap_or_default()
-    });
+    let mut entries_map = match fs::read(&entries_path) {
+        Ok(buffer) => match serde_json::from_slice::<HashMap<u64, String>>(&buffer) {
+            Ok(map) => map,
+            Err(e) => {
+                eprintln!("Error parsing `{}`: {}", entries_path.display(), e);
+                eprintln!("Please check your JSON syntax (commas, brackets, quotes).");
+                return;
+            }
+        },
+        Err(_) => {
+            println!("No entries file found, using default.");
+            Default::default()
+        }
+    };
+
+    // Auto-merge diff entries if they exist
+    if let Some(dir_name) = dir_path.file_name().and_then(|n| n.to_str()) {
+        if !dir_name.ends_with("_diff") {
+            let diff_dir_name = format!("{}_diff", dir_name);
+            // Assuming the diff directory is a sibling
+            if let Some(parent) = dir_path.parent() {
+                let diff_dir_path = parent.join(diff_dir_name);
+                let diff_entries_path = diff_dir_path.join(ENTRIES_FILE);
+
+                if diff_entries_path.exists() {
+                    println!("Found diff entries at: `{}`", diff_entries_path.display());
+                    match fs::read(&diff_entries_path) {
+                        Ok(buffer) => match serde_json::from_slice::<HashMap<u64, String>>(&buffer) {
+                            Ok(diff_map) => {
+                                println!("Merging {} entries from diff...", diff_map.len());
+                                for (id, value) in diff_map {
+                                    if !value.is_empty() || !entries_map.contains_key(&id) {
+                                        entries_map.insert(id, value);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error parsing diff entries `{}`: {}", diff_entries_path.display(), e);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error reading diff entries: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let table_dir = dir_path.join(TABLE_DIR);
 
@@ -182,7 +316,26 @@ pub fn pack_map<P: AsRef<Path>>(dir_path: P) {
 
             // Min: (3 + 1(0xFF)) + 16(entry_count + n * 0x80) + 4(padding 0) = 24
             // Max: (511 + 1(0xFF)) + 16(entry_count) = 528
-            let bucket_size = ((table_header.entry_count + 1) + 16).max(24);
+            let bucket_size = if dir_path
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("_diff")
+            {
+                let count = table_header.entry_count;
+                if count <= 8 {
+                    24
+                } else if count <= 128 {
+                    32
+                } else if count <= 256 {
+                    272
+                } else {
+                    528
+                }
+            } else {
+                ((table_header.entry_count + 1) + 16).max(24)
+            };
             let table_buckets = reader.read_array::<u8>(bucket_size as usize).unwrap();
 
             let entries_pos = reader.stream_position().unwrap();
@@ -218,14 +371,22 @@ pub fn pack_map<P: AsRef<Path>>(dir_path: P) {
 
                         new_values.extend(value.as_bytes());
                     } else {
-                        let value = reader
-                            .read_array_at::<u8>(value_pos, entry.length as usize)
-                            .unwrap();
+                        if let Some(value) = entries_map.get(&id) {
+                            new_entry.offset = offset as u32;
+                            new_entry.length = (value.len() + 1) as u32;
 
-                        new_entry.offset = offset as u32;
-                        new_entry.length = value.len() as u32;
+                            new_values.push(0xFF);
+                            new_values.extend(value.as_bytes());
+                        } else {
+                            let value = reader
+                                .read_array_at::<u8>(value_pos, entry.length as usize)
+                                .unwrap();
 
-                        new_values.extend(value.as_bytes());
+                            new_entry.offset = offset as u32;
+                            new_entry.length = value.len() as u32;
+
+                            new_values.extend(value.as_bytes());
+                        }
                     }
                 } else {
                     // Note: Not needed for game reading, just looks good
@@ -245,17 +406,6 @@ pub fn pack_map<P: AsRef<Path>>(dir_path: P) {
 
             buffer
         };
-
-        // Save modified tables for reference
-        {
-            let modified_dir = dir_path.join(MODIFIED_DIR);
-            let modified_path = modified_dir.join(table_idx.to_string());
-
-            fs::create_dir_all(&modified_dir).unwrap();
-
-            let mut writer = File::create(&modified_path).unwrap().buffer_write();
-            writer.write_all(&table_buffer).unwrap();
-        }
 
         let table_size = table_buffer.len();
         let table_encoded = zstd::encode_all(table_buffer.as_bytes(), 0).unwrap();
@@ -308,6 +458,48 @@ pub fn pack_map<P: AsRef<Path>>(dir_path: P) {
 
         let mut writer = File::create(&merged_path).unwrap().buffer_write();
         writer.write_all(&result).unwrap();
+
+        // If we are packing a main file, create an empty diff file to prevent conflicts
+        // regardless of whether we merged a diff file or not.
+        if !file_name.ends_with("_diff") {
+            let diff_file_name = format!("{}_diff", file_name);
+            let diff_path = merged_dir.join(diff_file_name);
+
+            // Create empty map file with 1 empty table (table 0)
+            // This matches the structure of original empty diff files
+            let empty_header = MapHeader {
+                magic: 0xDEADBEEF,
+                version: 1,
+                entry_count: 1,
+            };
+
+            // Table 0 data (empty)
+            let table0_data: &[u8] = &[];
+            let table0_encoded = zstd::encode_all(table0_data, 0).unwrap();
+            
+            let block_header = BlockHeader {
+                compression_type: 4,
+                compressed_size: table0_encoded.len() as u32,
+                decompressed_size: 0,
+            };
+
+            let mut block_data = Vec::new();
+            block_data.extend(bytemuck::bytes_of(&block_header));
+            block_data.extend(table0_encoded);
+
+            // Seek table: [0, block_size]
+            let seek_table = vec![0u32, block_data.len() as u32];
+
+            let mut empty_data = Vec::new();
+            empty_data.extend(bytemuck::bytes_of(&empty_header));
+            empty_data.extend(bytemuck::cast_slice(&seek_table));
+            empty_data.extend(block_data);
+
+            let mut writer = File::create(&diff_path).unwrap().buffer_write();
+            writer.write_all(&empty_data).unwrap();
+
+            println!("Created empty diff file: `{}`", diff_path.display());
+        }
 
         // let test_path = r"D:\wwm\wwm_lite\LocalData\Patch\HD\oversea\locale\translate_words_map_en";
         // fs::copy(merged_path, test_path).unwrap();
